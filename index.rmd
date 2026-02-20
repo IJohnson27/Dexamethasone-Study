@@ -1,0 +1,311 @@
+---
+title: "Multi-Factor Differential Gene Expression Analysis: Dexamethasone Drug Response (airway)"
+author: "Ibn Johnson"
+date: "2025-12-15"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_download: true
+---
+
+# 1.0 Summary
+
+For this analysis, the **'airway'** dataset was utilized. This dataset examines how human lung muscle cells react to the corticosteroid drug ***Dexamethasone***. The experimental design was organized to focus on two main variables: **Treatment** and **Cell Line**. This made it possible to account for differences between cell lines in order to isolate how the drug itself changed the genes.
+
+# 2.0 Project Setup and Data Acquisition/Preparation
+
+## 2.1 Package Installations
+
+```{r install_packages, eval=FALSE, include=TRUE}
+# INSTALL PACKAGES (For Reproducibility Only)
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# 1.
+BiocManager::install("DESeq2") 
+
+# 2.
+BiocManager::install("airway")
+
+# 3. Install CRAN packages (for data manipulation and visualization purposes)
+install.packages("tidyverse")
+```
+
+## 2.2 Loading data and Count Matrix Table Extraction
+
+```{r setup_airway, message=FALSE, warning=FALSE, echo=FALSE}
+
+# Load all necessary packages
+library(DESeq2)
+library(airway)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# 1. Load the data directly from the airway package
+data("airway")
+airway_data <- airway # This is an already defined Summarized Experiment object
+
+# 2. Extract the table showing how many of each gene was expressed
+count_matrix <- assay(airway_data)
+metadata <- as.data.frame(colData(airway_data))
+
+# 3. Clean up and verify the factors needed for multi-factor analysis
+metadata <- metadata %>%
+  dplyr::select(dex, cell) %>%
+  mutate(
+    # This will turn our complicated and messy ID names into simple, readable and unique labels: Line1, Line2, etc.
+    cell = factor(cell, labels = c("Line1", "Line2", "Line3", "Line4")),
+    # This portion ensures that the drug status is a clear category
+    dex = factor(dex, levels = c("untrt", "trt"))
+  ) #"untrt" is the first item in the levels vector. This sets 'untrt' as the baseline (control group)
+
+# --- Quality Control Checks ---
+# Check dimensions of the matrix and verify metadata alignment:
+# dim(count_matrix)
+# head(metadata)
+```
+
+# 3.0 Data Alignment and Matrix Preparation
+
+## 3.1 Aligning Medata and Count Matrices
+
+```{r data_alignment, message=FALSE, warning=FALSE, echo=TRUE}
+
+# 1. Align count_matrix columns to match the order of metadata rows
+count_matrix <- count_matrix[, match(rownames(metadata), colnames(count_matrix))]
+
+# 2. Stop the script if alignment is off
+stopifnot(all(colnames(count_matrix) == rownames(metadata)))
+
+# 3.Convert count matrix to a standard matrix for DESeq2
+count_matrix <- as.matrix(count_matrix)
+```
+
+# 4.0 DESeq2 Object Construction
+
+## 4.1 Create DESeqDataSet object
+
+```{r deseq_object_creation, message=FALSE, echo=TRUE}
+
+# 1. Create DESeq2 Object and define the multi-factor design formula
+# ~ cell + dex allows us to test for overall drug effect on cell lines
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = metadata,
+  design = ~ cell + dex # Utilizing a multi-factor additive model 
+)
+
+# 2. Pre-filtering: Remove genes with very low counts across all samples
+# Keep only rows (genes) with at least 10 reads total across all 8 samples
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+#Check dds object dimensions: print(dim(dds))
+```
+
+# 5.0 Differential Expression Analysis
+
+## 5.1 Multi-Factor Analysis (Additive Model)
+
+```{r analysis, message=FALSE, warning=FALSE, echo=TRUE}
+
+#1. Run the Analysis
+# This command performs normalization and dispersion estimation automatically
+dds <- DESeq(dds)
+
+# 2. Final check: Look at the results
+resultsNames(dds)
+```
+
+## 5.2 Extract and Filter Results
+
+```{r extract_results, message=FALSE, warning=FALSE, echo=TRUE}
+
+# 1. Extract the results for the treatment (dex) comparison using the specific comparison name from resultsNames()
+res <- results(dds, name="dex_trt_vs_untrt")
+
+# 2. Convert to a data frame
+res_df <- as.data.frame(res)
+
+# 3. Filter for significant genes (Adjusted P-value < 0.05)
+# Sort by log2FoldChange to see the biggest changes first
+sig_genes <- res_df %>%
+  filter(padj < 0.05) %>%
+  arrange(desc(abs(log2FoldChange)))
+
+# 4. View the top 10 most impacted genes:
+head(sig_genes, 10)
+
+# 5. Amount of significant genes found in total:
+nrow(sig_genes)
+```
+
+# 6.0 Gene ID Conversion: Ensembl to Symbol
+
+## 6.1 Mapping Ensembl IDs to Gene Symbols
+
+```{r annotate_results_fixed, message=FALSE, warning=FALSE, echo=TRUE}
+
+# 1. Extract Ensembl IDs from row names to use as keys for mapping
+
+my_ensembl_keys <- rownames(sig_genes)
+
+# 2. Add the 'symbol' column
+sig_genes$symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = my_ensembl_keys,         # Using the rownames directly
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+# 3. Add the 'entrez' column
+sig_genes$entrez <- mapIds(
+  org.Hs.eg.db,
+  keys = my_ensembl_keys,
+  column = "ENTREZID",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+# 4.View Data (Optional)
+# To view the top of the filtered results during manual review, use:
+# head(sig_genes)
+```
+
+# 7.0 Data Visualization
+
+## 7.1 Volcano Plot of Differential Expression
+
+```{r volcano_plot, message=FALSE, warning=FALSE, echo=TRUE}
+
+# 1. Add labels to the full dataset (res_df) so our plot displays ALL data points
+
+res_df$diffexpressed <- "NO"
+res_df$diffexpressed[res_df$log2FoldChange > 1 & res_df$padj < 0.05] <- "UP"
+res_df$diffexpressed[res_df$log2FoldChange < -1 & res_df$padj < 0.05] <- "DOWN"
+
+# 2. Build the plot using the full results (res_df)
+
+ggplot(data = res_df, aes(x = log2FoldChange, y = -log10(padj), col = diffexpressed)) +
+    geom_point(alpha = 0.4) + 
+    theme_classic() +
+    # Maps DOWN to blue, NO to grey, and UP to red
+    scale_color_manual(values = c("DOWN" = "blue", "NO" = "grey", "UP" = "red")) +
+    # Adds the vertical lines at 2-fold change to create the thresholds
+    geom_vline(xintercept = c(-1, 1), col = "grey50", linetype = "dashed") +
+    # Adds the horizontal line at p < 0.05 to create the threshold
+    geom_hline(yintercept = -log10(0.05), col = "grey50", linetype = "dashed") +
+    labs(title = "Gene Expression Response to Dexamethasone",
+         subtitle = "Red = Up-regulated | Blue = Down-regulated",
+         x = "Log2 Fold Change",
+         y = "-Log10 Adjusted P-value") +
+    # Label top 10 genes using the annotated sig_genes data frame
+    geom_text_repel(data = head(sig_genes[order(sig_genes$padj), ], 10), 
+                    aes(label = symbol),
+                    size = 3,
+                    max.overlaps = Inf,
+                    box.padding = 0.5,
+                    color = "black") #Keep it black for readability
+```
+
+# 8.0 Adding Pathway Analysis
+
+## 8.1 Check for/Install 'clusterProfiler' package for Gene Ontology analysis
+
+```{r ClusterProfiler_installation, eval=FALSE}
+
+if (!require("clusterProfiler", quietly = TRUE))
+    BiocManager::install("clusterProfiler")
+```
+
+## 8.2 Pathway Analysis
+
+```{r pathway-analysis, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(clusterProfiler)
+library(stringr)
+
+# 1. Run the enrichment (using 'ENTREZID' which clusterProfiler prefers)
+ego <- enrichGO(gene          = sig_genes$entrez,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "BP", # "BP" stands for Biological Process
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+                readable      = TRUE)
+```
+
+# 9.0 Visualizing Biological Enrichment
+
+## 9.1 Create the Plot
+
+A dot plot will display the top pathways. The size of the dot represents the number of genes while the color represents the statistical significance.
+
+```{r go-dotplot, echo=TRUE, fig.height=8, fig.width=10}
+
+dotplot(ego, showCategory=15, orderBy = "p.adjust", decreasing = FALSE) + 
+  scale_y_discrete(labels = function (x) str_wrap(x,width = 40)) + #Use str_wrap() to prevent lengthy names of Biological Processes. This limits strings to 40 characters per line
+ggtitle("Biological Processes Involved in Dexamethasone Treatment")
+```
+
+## 9.2 Gene Ratio Values
+
+```{r enrichgo_results}
+
+# Results get converted to a dataframe. Convert the GeneRatio column (from the ego_results table) into decimals for easier sorting and plotting
+
+ego_results <- as.data.frame(ego)
+
+ego_results$ratio_decimal <- sapply(ego_results$GeneRatio, function(x) {
+  num_den <- as.numeric(unlist(strsplit(x, "/")))
+  num_den[1] / num_den[2]
+})
+
+```
+
+## 9.3 Create a new column: Convert GeneRatio Class
+
+```{r Numeric GeneRatio column, echo=TRUE}
+
+# Create a new GeneRatio column So that ratio values will be read as numeric ratios rather than character strings. This allows for better sorting
+
+ego_results$Ratio <- sapply(ego_results$GeneRatio, function(x) {
+  num_den <- unlist(strsplit(x, "/"))
+  return(as.numeric(num_den[1]) / as.numeric(num_den[2]))
+})
+```
+
+# 10.0 DataTalk: The Interactive Enrichment Results
+
+```{r DataTalk installation, message=FALSE, warning=FALSE, echo=TRUE}
+
+if (!require("DT", quietly = TRUE))
+    install.packages("DT")
+
+library(DT)
+
+
+# Table of top 20 results
+datatable(ego_results[1:20, c("ID", "Description", "Ratio", "p.adjust")], 
+          colnames = c("GO ID", "Pathway Description", "Ratio", "Adj. P-Value"),
+          caption = "Table 1: Top 20 Enriched Biological Processes",
+          options = list(pageLength = 5))
+```
+
+# 11.0 Conclusion:
+
+The top enriched pathway was found to be Extracellular Matrix Organization, which showed the highest Gene Ratio in our analysis. This result indicates that Dexamethasone (a corticosteroid) has a significant impact on the structure of smooth muscle cells. This aligns well with what is clinically known regarding the effects that corticosteroids have on connective tissue.
+
+# 12.0 Reproducibility & Software Versions
+
+To ensure the reproducibility of this analysis, the software versions and system dependencies used are documented below:
+
+```{r session-info}
+sessionInfo()
+```
